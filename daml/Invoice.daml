@@ -1,0 +1,75 @@
+-- | This module defines the core invoice contracts for the factoring workflow.
+-- It includes the initial invoice proposal and the verified invoice that results
+-- from the buyer's acknowledgement.
+module Invoice where
+
+import DA.Date (Date)
+
+-- | Represents an invoice that has been issued by a supplier to a buyer.
+-- This is a proposal contract that needs to be acknowledged by the buyer
+-- before it can be considered for factoring.
+template Invoice
+  with
+    supplier    : Party     -- ^ The party issuing the invoice (e.g., an SME).
+    buyer       : Party     -- ^ The party obligated to pay the invoice.
+    operator    : Party     -- ^ The platform operator, facilitating the process.
+    invoiceId   : Text      -- ^ A unique identifier for the invoice from the supplier's system.
+    amount      : Decimal   -- ^ The total amount due. Must be positive.
+    currency    : Text      -- ^ The currency of the amount (e.g., "USD", "EUR").
+    issueDate   : Date      -- ^ The date the invoice was issued.
+    dueDate     : Date      -- ^ The date the invoice payment is due. Must be on or after the issue date.
+    description : Text      -- ^ A description of the goods or services rendered.
+  where
+    signatory supplier
+    observer buyer, operator
+
+    ensure amount > 0.0
+      && dueDate >= issueDate
+      && supplier /= buyer
+      && operator /= supplier
+      && operator /= buyer
+
+    -- | The buyer acknowledges the validity of the invoice, transforming it
+    -- into a `VerifiedInvoice` that can be put up for factoring.
+    choice Acknowledge : ContractId VerifiedInvoice
+      controller buyer
+      do
+        create VerifiedInvoice with ..
+
+    -- | The supplier can cancel the invoice proposal before it is acknowledged by the buyer.
+    choice Cancel : ()
+      controller supplier
+      do
+        pure () -- The archival of self is implicit in consuming choices.
+
+-- | Represents an invoice that has been mutually agreed upon by the supplier and the buyer.
+-- This contract is the basis for subsequent factoring proposals and financing.
+template VerifiedInvoice
+  with
+    supplier    : Party
+    buyer       : Party
+    operator    : Party
+    invoiceId   : Text
+    amount      : Decimal
+    currency    : Text
+    issueDate   : Date
+    dueDate     : Date
+    description : Text
+  where
+    signatory supplier, buyer
+    observer operator
+
+    key (supplier, invoiceId) : (Party, Text)
+    maintainer key._1
+
+    -- | A non-consuming choice allowing authorized parties to view the invoice details.
+    nonconsuming choice GetView : VerifiedInvoice
+      controller operator, supplier, buyer
+      do
+        pure self
+
+    -- Future choices to enable the factoring workflow will be added in subsequent modules.
+    -- For example:
+    -- nonconsuming choice RequestFactoring : ContractId FactoringRequest
+    --   controller supplier
+    --   do ...
