@@ -1,0 +1,15 @@
+sdk-version: 3.4.0
+name: canton-invoice-factoring
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+build-options:
+  - --target=2.1
+data-dependencies:
+# Example of including a standard library DAR, if needed.
+# - .daml/dist/daml-finance-interface-issuance-0.2.0.dar
+# - .daml/dist/daml-finance-interface-lifecycle-0.2.0.dar
+# - .daml/dist/daml-finance-interface-types-common-0.2.0.dar
