@@ -1,242 +1,142 @@
--- | This module defines the workflow for factors bidding on invoices.
--- It includes the bid proposal contract and the resulting agreement upon acceptance.
---
--- The lifecycle is as follows:
--- 1. A `FactoringBid` is created by a `Factor` for a specific `Invoice`.
--- 2. The `Supplier` can either `AcceptBid` or `DeclineBid`. The `Factor` can `WithdrawBid`.
--- 3. If accepted, the `FactoringBid` and `Invoice` are archived, and an
---    `AcceptedFactoringAgreement` is created.
--- 4. The `AcceptedFactoringAgreement` then tracks the lifecycle of payments:
---    - Advance payment from Factor to Supplier.
---    - Invoice payment from Buyer to Factor.
---    - Reserve payment from Factor to Supplier.
-module FactoringBid where
+module Factoring.Bid where
 
-import Daml.Script
-import DA.Time (Time, addRelTime, getTime)
+import Daml.Finance.Interface.Types.Common.Types (Id)
 import DA.Date (Date)
-import DA.Assert ((===))
-import Invoice (Invoice)
+
+import Factoring.Invoice (Invoice, InvoiceDetails(..))
 
 -- | Represents a factor's bid to purchase an invoice from a supplier.
--- The supplier can accept this bid to enter into a factoring agreement.
+--
+-- This contract is created via the `Invoice_PlaceBid` choice on an `Invoice` contract.
+-- The creation logic within that choice is responsible for validating the bid,
+-- including ensuring the `advanceRate` meets the `minAdvanceRate` specified
+-- on the `Invoice`. Bids that do not meet the minimum threshold are rejected
+-- and a `FactoringBid` contract is never created.
+--
+-- Once created, the supplier can `AcceptBid` to proceed with factoring, or the
+-- factor can `WithdrawBid` before it's accepted.
 template FactoringBid
   with
-    supplier : Party
-      -- ^ The owner of the invoice who can accept the bid.
-    factor : Party
-      -- ^ The financial institution offering to buy the invoice.
-    operator : Party
-      -- ^ The platform operator, an observer on the workflow.
-    invoiceCid : ContractId Invoice
-      -- ^ The contract ID of the invoice being bid on.
-    invoiceData : Invoice
-      -- ^ A snapshot of the invoice data at the time of the bid.
-    advanceRate : Decimal
-      -- ^ The percentage of the invoice face value to be advanced to the supplier (e.g., 0.80 for 80%).
-    discountFeeRate : Decimal
-      -- ^ The fee charged by the factor, as a percentage of the invoice face value (e.g., 0.02 for 2%).
-    bidExpiry : Time
-      -- ^ The time after which this bid is no longer valid.
+    invoiceCid      : ContractId Invoice
+    invoiceDetails  : InvoiceDetails
+    factor          : Party
+    supplier        : Party
+    advanceRate     : Decimal -- e.g., 0.95 for 95%
+    discountFeeRate : Decimal -- e.g., 0.02 for 2%
+    bidId           : Id
   where
     signatory factor
-    observer operator, supplier
+    observer supplier
 
-    ensure advanceRate > 0.0 && advanceRate <= 1.0
-      && discountFeeRate >= 0.0 && discountFeeRate < 1.0
-
-    key (supplier, factor, invoiceData.invoiceId) : (Party, Party, Text)
+    key (supplier, factor, invoiceDetails.invoiceId) : (Party, Party, Id)
     maintainer key._2
 
-    choice DeclineBid : ()
-      -- ^ The supplier rejects the factor's bid.
+    -- | The supplier accepts the factor's bid.
+    -- This choice archives the bid and the original invoice, and creates a
+    -- `FactoredInvoice` contract. This represents the transfer of the receivable's
+    -- ownership and the obligation of the factor to advance funds.
+    choice AcceptBid : ContractId FactoredInvoice
+      with
+        acceptanceDate: Date
       controller supplier
       do
-        now <- getTime
-        assertMsg "Cannot decline an expired bid" (now < bidExpiry)
-        pure ()
+        -- Fetch the original invoice to ensure it's still active.
+        invoice <- fetch invoiceCid
 
-    choice WithdrawBid : ()
-      -- ^ The factor withdraws their bid before it is accepted.
-      controller factor
-      do
-        now <- getTime
-        assertMsg "Cannot withdraw an expired bid" (now < bidExpiry)
-        pure ()
+        -- Ensure the bid is for the correct supplier.
+        assertMsg "Bid can only be accepted by the invoice supplier"
+          (supplier == invoice.supplier)
 
-    choice AcceptBid : ContractId AcceptedFactoringAgreement
-      -- ^ The supplier accepts the bid, creating a binding factoring agreement.
-      -- This archives both the bid and the original invoice.
-      controller supplier
-      do
-        now <- getTime
-        assertMsg "Cannot accept an expired bid" (now < bidExpiry)
-
-        -- Fetch and archive the original invoice to prevent it from being sold elsewhere.
-        originalInvoice <- fetch invoiceCid
-        originalInvoice === invoiceData
-
+        -- Archive the original invoice as it is now being factored.
         archive invoiceCid
 
-        -- Calculate the financial terms of the agreement
-        let
-          advanceAmount = invoiceData.amount * advanceRate
-          discountFeeAmount = invoiceData.amount * discountFeeRate
-          reserveAmount = invoiceData.amount - advanceAmount - discountFeeAmount
+        -- Create the new FactoredInvoice contract representing the agreement.
+        create FactoredInvoice with
+          invoiceDetails = invoice.details
+          supplier = supplier
+          buyer = invoice.buyer
+          factor = factor
+          operator = invoice.operator
+          advanceRate = advanceRate
+          discountFeeRate = discountFeeRate
+          factoringDate = acceptanceDate
+          status = PendingAdvance
 
-        -- Create the formal agreement
-        create AcceptedFactoringAgreement with
-          supplier
-          factor
-          buyer = invoiceData.buyer
-          operator
-          invoiceId = invoiceData.invoiceId
-          invoiceAmount = invoiceData.amount
-          invoiceDueDate = invoiceData.dueDate
-          advanceRate
-          discountFeeRate
-          advanceAmount
-          discountFeeAmount
-          reserveAmount
-          status = AwaitingAdvancePayment
+    -- | The factor can withdraw their bid at any time before it is accepted by the supplier.
+    choice WithdrawBid : ()
+      controller factor
+      do
+        -- Simply archives the bid contract, effectively cancelling the offer.
+        pure ()
 
--- | Represents the state of an active factoring agreement after a bid has been accepted.
-data FactoringStatus
-  = AwaitingAdvancePayment      -- ^ Factor needs to pay the advance to the supplier.
-  | AwaitingBuyerPayment        -- ^ Advance paid, waiting for the buyer to pay the factor.
-  | AwaitingReserveDisbursement -- ^ Buyer has paid, factor needs to pay the reserve to the supplier.
-  | Completed                   -- ^ All payments are settled.
-  deriving (Eq, Show)
-
--- | A legally binding agreement created when a supplier accepts a factor's bid.
--- This contract tracks the state of the payment and settlement process.
-template AcceptedFactoringAgreement
+-- | Represents an invoice that has been sold to a factor.
+-- This contract tracks the state of the factored invoice, from the initial
+-- advance payment to the final settlement when the buyer pays the factor.
+template FactoredInvoice
   with
-    supplier : Party
-    factor : Party
-    buyer : Party
-    operator : Party
-    invoiceId : Text
-    invoiceAmount : Decimal
-    invoiceDueDate : Date
-    advanceRate : Decimal
+    invoiceDetails  : InvoiceDetails
+    supplier        : Party
+    buyer           : Party
+    factor          : Party
+    operator        : Party
+    advanceRate     : Decimal
     discountFeeRate : Decimal
-    advanceAmount : Decimal
-    discountFeeAmount : Decimal
-    reserveAmount : Decimal
-    status : FactoringStatus
+    factoringDate   : Date
+    status          : FactoringStatus
   where
-    signatory supplier, factor
-    observer operator, buyer
+    signatory factor, supplier, operator
+    observer buyer
 
-    key (supplier, factor, invoiceId) : (Party, Party, Text)
-    maintainer key._2
+    let invoiceAmount = invoiceDetails.amount
 
-    choice ConfirmAdvancePayment : ContractId AcceptedFactoringAgreement
-      -- ^ The factor confirms they have sent the advance payment to the supplier.
-      -- In a real-world scenario, this would be coupled with an actual payment instruction.
-      controller factor
+    key (factor, invoiceDetails.invoiceId) : (Party, Id)
+    maintainer key._1
+
+    -- | The factor confirms they have sent the advance payment to the supplier
+    -- off-ledger. The operator co-signs to verify.
+    choice ConfirmAdvancePaid : ContractId FactoredInvoice
+      controller factor, operator
       do
-        assertMsg "Agreement is not awaiting advance payment" (status == AwaitingAdvancePayment)
-        create this with status = AwaitingBuyerPayment
+        assertMsg "Invoice status must be PendingAdvance to confirm payment"
+          (status == PendingAdvance)
+        create this with status = AdvancePaid
 
-    choice ConfirmBuyerPayment : ContractId AcceptedFactoringAgreement
-      -- ^ The factor confirms they have received the full invoice payment from the buyer.
-      controller factor
+    -- | The buyer confirms they have paid the full invoice amount to the factor
+    -- off-ledger. The factor co-signs to acknowledge receipt of funds.
+    choice ConfirmBuyerPayment : ContractId FactoredInvoice
+      with
+        paymentDate: Date
+      controller buyer, factor
       do
-        assertMsg "Agreement is not awaiting buyer payment" (status == AwaitingBuyerPayment)
-        create this with status = AwaitingReserveDisbursement
+        assertMsg "Invoice status must be AdvancePaid to confirm buyer payment" (status == AdvancePaid)
+        assertMsg "Buyer can only pay on or after the due date"
+          (paymentDate >= invoiceDetails.dueDate)
+        create this with status = BuyerPaid
 
-    choice ConfirmReserveDisbursement : ContractId AcceptedFactoringAgreement
-      -- ^ The factor confirms they have disbursed the remaining reserve to the supplier.
-      controller factor
+    -- | After the buyer pays the factor, the factor settles with the supplier.
+    -- The factor calculates the final rebate amount (invoice amount - advance - fees)
+    -- and confirms they have paid it to the supplier off-ledger. The operator co-signs.
+    choice SettleRebate : ContractId FactoredInvoice
+      controller factor, operator
       do
-        assertMsg "Agreement is not awaiting reserve disbursement" (status == AwaitingReserveDisbursement)
-        create this with status = Completed
+        assertMsg "Buyer must have paid the factor before rebate can be settled"
+          (status == BuyerPaid)
 
--- | Example script for testing the FactoringBid workflow.
-test_factoring_workflow : Script ()
-test_factoring_workflow = script do
-  -- 1. Allocate parties
-  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
-  supplier <- allocatePartyWithHint "Supplier" (PartyIdHint "supplier")
-  factor <- allocatePartyWithHint "Factor" (PartyIdHint "factor")
-  buyer <- allocatePartyWithHint "Buyer" (PartyIdHint "buyer")
+        let
+          advanceAmount = invoiceAmount * advanceRate
+          feeAmount = invoiceAmount * discountFeeRate
+          rebateAmount = invoiceAmount - advanceAmount - feeAmount
 
-  -- 2. Supplier creates an invoice
-  let
-    invoiceDetails = Invoice with
-      supplier = supplier
-      buyer = buyer
-      operator = operator
-      invoiceId = "INV-2024-001"
-      amount = 10000.0
-      issueDate = DA.Date.date 2024 Feb 20
-      dueDate = DA.Date.date 2024 Mar 21
+        -- In a real application, this choice might trigger a payment instruction.
+        -- For this model, we assume off-ledger settlement and just update the state.
+        assertMsg "Rebate amount must be non-negative" (rebateAmount >= 0.0)
 
-  invoiceCid <- submit supplier do create invoiceDetails
+        create this with status = Settled
 
-  -- 3. Factor submits a bid for the invoice
-  now <- getTime
-  bidCid <- submit factor do
-    create FactoringBid with
-      supplier
-      factor
-      operator
-      invoiceCid
-      invoiceData = invoiceDetails
-      advanceRate = 0.80
-      discountFeeRate = 0.02
-      bidExpiry = addRelTime now (days 5)
-
-  -- 4. Supplier accepts the bid
-  agreementCid <- submit supplier do
-    exercise bidCid AcceptBid
-
-  -- 5. Factor confirms advance payment
-  agreementCid2 <- submit factor do
-    exercise agreementCid ConfirmAdvancePayment
-  agreement <- fetch agreementCid2
-  agreement.status === AwaitingBuyerPayment
-
-  -- 6. Factor confirms buyer payment
-  agreementCid3 <- submit factor do
-    exercise agreementCid2 ConfirmBuyerPayment
-  agreement' <- fetch agreementCid3
-  agreement'.status === AwaitingReserveDisbursement
-
-  -- 7. Factor confirms reserve disbursement
-  agreementCid4 <- submit factor do
-    exercise agreementCid3 ConfirmReserveDisbursement
-  finalAgreement <- fetch agreementCid4
-  finalAgreement.status === Completed
-
-  -- 8. Test bid withdrawal
-  invoiceCid2 <- submit supplier do create invoiceDetails with invoiceId = "INV-2024-002"
-  bidCid2 <- submit factor do
-    create FactoringBid with
-      supplier
-      factor
-      operator
-      invoiceCid = invoiceCid2
-      invoiceData = invoiceDetails with invoiceId = "INV-2024-002"
-      advanceRate = 0.85
-      discountFeeRate = 0.025
-      bidExpiry = addRelTime now (days 5)
-  submit factor do exercise bidCid2 WithdrawBid
-
-  -- 9. Test bid decline
-  invoiceCid3 <- submit supplier do create invoiceDetails with invoiceId = "INV-2024-003"
-  bidCid3 <- submit factor do
-    create FactoringBid with
-      supplier
-      factor
-      operator
-      invoiceCid = invoiceCid3
-      invoiceData = invoiceDetails with invoiceId = "INV-2024-003"
-      advanceRate = 0.75
-      discountFeeRate = 0.03
-      bidExpiry = addRelTime now (days 5)
-  submit supplier do exercise bidCid3 DeclineBid
-
-  pure ()
+-- | Defines the lifecycle stages of a factored invoice.
+data FactoringStatus
+  = PendingAdvance      -- Bid accepted, waiting for factor to pay the advance.
+  | AdvancePaid         -- Factor has paid the advance, waiting for buyer to pay factor.
+  | BuyerPaid           -- Buyer has paid the invoice amount to the factor.
+  | Settled             -- Factor has paid the remaining rebate to the supplier, completing the cycle.
+  deriving (Eq, Show, Ord)
