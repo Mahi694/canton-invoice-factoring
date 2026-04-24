@@ -1,0 +1,139 @@
+-- | This module defines the Advance contract, which represents the core of the
+-- | invoice factoring process: the disbursement of funds from the factor to the
+-- | supplier against an invoice. It also defines the settlement lifecycle.
+-- |
+-- | The workflow is as follows:
+-- | 1. A Supplier accepts a `FactoringBid.FactoringBid`.
+-- | 2. This creates an `Advance` contract, signifying the funds have been advanced.
+-- | 3. The `Advance` contract remains active until the invoice's due date.
+-- | 4. The Buyer, who is an observer on this contract, settles the invoice by paying
+-- |    the Factor the full invoice amount. This is modelled by the `Settle` choice.
+-- | 5. Exercising `Settle` archives the `Advance` contract and creates a `SettledAdvance`
+-- |    receipt contract for all parties.
+module Advance where
+
+import Daml.Script
+import DA.Date
+import DA.Time
+
+import qualified Invoice
+import qualified FactoringBid
+
+-- | Represents the disbursed funds from a factor to a supplier for a factored invoice.
+-- This contract is created when a supplier accepts a factoring bid. It remains active
+-- until the buyer settles the original invoice at its maturity date, paying the factor.
+template Advance
+  with
+    supplier      : Party                 -- ^ The party who issued the invoice and received the advance.
+    factor        : Party                 -- ^ The financial institution that provided the advance.
+    buyer         : Party                 -- ^ The party obligated to pay the original invoice.
+    invoiceCid    : ContractId Invoice.Invoice -- ^ Reference to the original invoice contract.
+    invoiceData   : Invoice.InvoiceData   -- ^ The details of the original invoice.
+    bidData       : FactoringBid.FactoringBidData -- ^ The terms of the accepted bid.
+    advanceAmount : Decimal               -- ^ The amount advanced to the supplier (invoice amount * advance rate).
+  where
+    signatory supplier, factor
+    observer buyer
+
+    key (supplier, factor, invoiceData.invoiceId) : (Party, Party, Text)
+    maintainer key._2
+
+    ensure
+      advanceAmount == invoiceData.amount * bidData.advanceRate &&
+      advanceAmount > 0.0
+
+    -- | The buyer pays the full invoice amount to the factor upon maturity.
+    -- This settles the advance and completes the factoring lifecycle.
+    choice Settle : ContractId SettledAdvance
+      controller buyer
+      do
+        -- In a production system, this choice would be coupled with a payment instruction,
+        -- likely using a Delivery-vs-Payment (DVP) pattern with a tokenized currency.
+        -- For this model, we represent settlement by archiving this contract and creating
+        -- a permanent settlement record.
+        now <- getTime
+        create SettledAdvance with
+          settlementTimestamp = now
+          ..
+
+-- | A record indicating that an invoice advance has been fully settled by the buyer.
+-- This serves as a final, immutable record of the completed transaction for all parties,
+-- useful for accounting and auditing.
+template SettledAdvance
+  with
+    supplier      : Party
+    factor        : Party
+    buyer         : Party
+    invoiceData   : Invoice.InvoiceData
+    bidData       : FactoringBid.FactoringBidData
+    advanceAmount : Decimal
+    settlementTimestamp : Time
+  where
+    signatory supplier, factor, buyer
+
+    key (supplier, factor, invoiceData.invoiceId) : (Party, Party, Text)
+    maintainer key._2
+
+-- | Test script for the Advance workflow.
+-- It simulates the creation of an Advance contract and its subsequent settlement by the buyer.
+setup_Advance : Script ()
+setup_Advance = script do
+  supplier <- allocatePartyWithHint "SupplierCorp" (PartyIdHint "suppliercorp")
+  factor   <- allocatePartyWithHint "FactorBank" (PartyIdHint "factorbank")
+  buyer    <- allocatePartyWithHint "BuyerCo" (PartyIdHint "buyerco")
+
+  let invoiceDetails = Invoice.InvoiceData
+        { issuer = supplier
+        , owner = supplier
+        , buyer = buyer
+        , invoiceId = "INV-2024-ADV-001"
+        , amount = 100_000.00
+        , currency = "USD"
+        , issueDate = date 2024 Mar 1
+        , dueDate = date 2024 May 30
+        , description = "Supply of industrial components"
+        }
+
+  invoiceCid <- submit supplier do
+    createCmd Invoice.Invoice with ..invoiceDetails
+
+  let bidDetails = FactoringBid.FactoringBidData
+        { factor = factor
+        , advanceRate = 0.90 -- 90% advance rate
+        , discountFeeRate = 0.05 -- 5% discount fee
+        }
+
+  -- In the full workflow, an Advance is created by the Supplier accepting a FactoringBid.
+  -- For this test, we create it directly to focus on the Advance lifecycle itself.
+  let advAmount = invoiceDetails.amount * bidDetails.advanceRate
+  advanceCid <- submitMulti [supplier, factor] [] do
+    createCmd Advance with
+      supplier = supplier
+      factor = factor
+      buyer = buyer
+      invoiceCid = invoiceCid
+      invoiceData = invoiceDetails
+      bidData = bidDetails
+      advanceAmount = advAmount
+
+  -- Now, the buyer settles the invoice by paying the factor.
+  settledCid <- submit buyer do
+    exerciseCmd advanceCid Settle
+
+  -- Verify the settled contract exists and has the correct details.
+  Some settledContract <- queryContractId buyer settledCid
+  debug settledContract
+
+  assert (settledContract.supplier == supplier)
+  assert (settledContract.factor == factor)
+  assert (settledContract.buyer == buyer)
+  assert (settledContract.invoiceData.invoiceId == "INV-2024-ADV-001")
+  assert (settledContract.invoiceData.amount == 100_000.00)
+  assert (settledContract.advanceAmount == 90_000.00)
+  assert (settledContract.bidData.advanceRate == 0.90)
+
+  -- Verify the original Advance contract is archived.
+  None <- queryContractId buyer advanceCid
+  debug "Advance settlement test completed successfully."
+
+  pure ()
