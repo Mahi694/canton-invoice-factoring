@@ -1,0 +1,93 @@
+-- |
+-- This module defines the final stage of the invoice factoring workflow: repayment.
+-- The `Repayment` contract represents the buyer's obligation to settle the factored
+-- invoice. Upon maturity, the buyer exercises the `SettleWithPayment` choice,
+-- providing a fungible asset. This choice atomically splits the payment,
+-- repaying the factor for their advance plus their fee, and routing any
+-- remaining amount back to the original supplier.
+--
+module InvoiceFactoring.Repayment where
+
+import Daml.Finance.Interface.Asset.Fungible qualified as Fungible (I, split, transfer)
+import Daml.Finance.Interface.Types.Common.Types (InstrumentKey)
+import InvoiceFactoring.Invoice (InvoiceDetails)
+import DA.Date (Date)
+import DA.Assert (assertMsg)
+
+-- | Represents the buyer's explicit obligation to pay the invoice amount at maturity,
+-- with instructions to route the funds to the factor and supplier. This contract
+-- is typically created after a factor's bid is accepted and an advance is made.
+template Repayment
+  with
+    buyer: Party
+      -- ^ The party obligated to pay the invoice.
+    factor: Party
+      -- ^ The factor who receives the principal repayment and fee.
+    supplier: Party
+      -- ^ The original supplier who receives the remainder after the factor is paid.
+    invoiceDetails: InvoiceDetails
+      -- ^ Details of the original invoice being settled.
+    advanceAmount: Decimal
+      -- ^ The amount advanced by the factor to the supplier.
+    factorFee: Decimal
+      -- ^ The fee earned by the factor for providing the advance.
+    maturityDate: Date
+      -- ^ The due date for the invoice payment.
+    paymentInstrument: InstrumentKey
+      -- ^ The instrument key for the expected payment (e.g., USD, EUR).
+  where
+    signatory buyer, factor
+    observer supplier
+
+    key (buyer, factor, invoiceDetails.id) : (Party, Party, Text)
+    maintainer key._1, key._2
+
+    ensure
+      advanceAmount > 0.0 &&
+      factorFee >= 0.0 &&
+      (advanceAmount + factorFee) <= invoiceDetails.amount
+
+    -- | The buyer provides a fungible asset contract to settle the full invoice amount.
+    -- The payment is atomically split between the factor and the supplier according to
+    -- the terms of the factoring agreement.
+    choice SettleWithPayment : ()
+      with
+        paymentCid : ContractId Fungible.I
+          -- ^ The fungible asset contract representing the full invoice payment.
+      controller buyer
+      do
+        -- Fetch the payment contract to verify its details.
+        payment <- fetch paymentCid
+        let totalDueToFactor = advanceAmount + factorFee
+        let remainderDueToSupplier = invoiceDetails.amount - totalDueToFactor
+
+        -- Assert that the payment is of the correct instrument and covers the full invoice amount.
+        assertMsg "Payment instrument does not match the required instrument" $
+          payment.instrument == paymentInstrument
+        assertMsg "Payment amount does not match the full invoice amount" $
+          payment.amount == invoiceDetails.amount
+
+        -- Assert that the controller (buyer) is the owner of the payment contract.
+        assertMsg "Controller is not the owner of the payment contract" $
+          payment.owner == buyer
+
+        -- Split the payment and transfer the respective portions.
+        -- If there is no remainder for the supplier, the entire amount is transferred to the factor.
+        if remainderDueToSupplier > 0.0 then do
+          (factorPortionCid, supplierPortionCid) <- Fungible.split paymentCid [totalDueToFactor, remainderDueToSupplier]
+
+          -- Transfer the factor's portion to the factor.
+          factorReceipt <- Fungible.transfer factorPortionCid with newOwner = factor
+          -- Transfer the supplier's remaining portion back to the supplier.
+          supplierReceipt <- Fungible.transfer supplierPortionCid with newOwner = supplier
+
+          return ()
+        else do
+          -- The total due to the factor is the entire invoice amount.
+          assertMsg "Total due to factor must equal invoice amount when there is no remainder" $
+            totalDueToFactor == invoiceDetails.amount
+
+          -- Transfer the entire payment to the factor.
+          factorReceipt <- Fungible.transfer paymentCid with newOwner = factor
+
+          return ()
