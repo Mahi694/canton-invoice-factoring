@@ -1,0 +1,212 @@
+module FactoringTest where
+
+import Daml.Script
+import DA.Assert
+import DA.Date as Date
+import DA.Time (time)
+import DA.Optional (isNone)
+
+import Invoice
+import FactoringBid
+import Advance
+import Repayment
+
+-- | A helper script to set up the parties for the tests.
+setupParties = do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+  supplier <- allocatePartyWithHint "Supplier" (PartyIdHint "supplier")
+  buyer <- allocatePartyWithHint "Buyer" (PartyIdHint "buyer")
+  factor <- allocatePartyWithHint "Factor" (PartyIdHint "factor")
+  return (operator, supplier, buyer, factor)
+
+-- | Main test suite that runs all individual test cases.
+factoringTests = script do
+  -- Note: Daml Script has a "timeless" execution model.
+  -- Tests involving time-dependent logic (like default declarations after a due date)
+  -- rely on the template logic using `getTime`. For these tests to pass consistently,
+  -- we use dates in the past to ensure `getTime` is always after the due date.
+  test_full_successful_flow
+  test_reject_bid
+  test_buyer_default_and_supplier_recourse
+  test_unauthorized_actions
+
+-- | Test the complete "happy path" workflow:
+-- 1. Supplier creates an invoice.
+-- 2. Factor places a bid.
+-- 3. Supplier accepts the bid, creating an Advance.
+-- 4. Buyer pays the invoice, creating a Repayment.
+-- 5. Factor distributes the funds, completing the cycle.
+test_full_successful_flow = script do
+  (operator, supplier, buyer, factor) <- setupParties
+  let
+    invoiceId = "INV-2023-001"
+    amount = 10000.0
+    issueDate = Date.date 2023 Jan 1
+    dueDate = Date.date 2023 Mar 1
+    advanceRate = 0.80 -- 80%
+    discountFee = 500.0
+
+  -- 1. Supplier creates an invoice.
+  invoiceCid <- submit supplier do
+    createCmd Invoice with
+      operator, supplier, buyer, invoiceId, amount, issueDate, dueDate
+
+  -- 2. Factor submits a bid on the invoice.
+  bidCid <- submit factor do
+    exerciseCmd invoiceCid Invoice_SubmitBid with
+      factor, advanceRate, discountFee
+
+  -- 3. Supplier accepts the bid. This archives the Invoice and Bid, and creates an Advance.
+  advanceCid <- submit supplier do
+    exerciseCmd bidCid FactoringBid_Accept
+
+  -- 4. Buyer settles the invoice at or after maturity. This archives the Advance and creates a Repayment.
+  repaymentCid <- submit buyer do
+    exerciseCmd advanceCid Advance_SettleInvoice with settlementAmount = amount
+
+  -- 5. Factor distributes the settlement funds. This archives the Repayment.
+  submit factor do
+    exerciseCmd repaymentCid Repayment_DistributeFunds
+
+  -- 6. Verify final state: all workflow contracts should be archived.
+  invoices <- query @Invoice supplier
+  assertMsg "Invoice should be archived after being factored" $ null invoices
+
+  bids <- query @FactoringBid supplier
+  assertMsg "FactoringBid should be archived after acceptance" $ null bids
+
+  advances <- query @Advance supplier
+  assertMsg "Advance should be archived after settlement" $ null advances
+
+  repayments <- query @Repayment supplier
+  assertMsg "Repayment should be archived after distribution" $ null repayments
+
+  return ()
+
+-- | Test the scenario where a supplier rejects a factoring bid.
+-- The bid should be archived, but the original invoice should remain active.
+test_reject_bid = script do
+  (operator, supplier, buyer, factor) <- setupParties
+  let
+    invoiceId = "INV-2023-002"
+    amount = 5000.0
+    issueDate = Date.date 2023 Feb 1
+    dueDate = Date.date 2023 Apr 1
+
+  -- 1. Supplier creates an invoice.
+  invoiceCid <- submit supplier do
+    createCmd Invoice with
+      operator, supplier, buyer, invoiceId, amount, issueDate, dueDate
+
+  -- 2. Factor submits a bid.
+  bidCid <- submit factor do
+    exerciseCmd invoiceCid Invoice_SubmitBid with
+      factor, advanceRate = 0.75, discountFee = 250.0
+
+  -- 3. Supplier rejects the bid.
+  submit supplier do
+    exerciseCmd bidCid FactoringBid_Reject
+
+  -- 4. Verify state: Bid is archived, Invoice is active.
+  bids <- query @FactoringBid supplier
+  assertMsg "FactoringBid should be archived after rejection" $ null bids
+
+  maybeInvoice <- queryContractId supplier invoiceCid
+  assertMsg "Invoice should still be active after a bid rejection" $ not $ isNone maybeInvoice
+
+  return ()
+
+-- | Test the default scenario with recourse:
+-- 1. An advance is created as normal.
+-- 2. The buyer fails to pay by the due date.
+-- 3. The factor declares a default.
+-- 4. The supplier repays the factor directly to cover the loss.
+test_buyer_default_and_supplier_recourse = script do
+  (operator, supplier, buyer, factor) <- setupParties
+  let
+    invoiceId = "INV-2023-003"
+    amount = 25000.0
+    issueDate = Date.date 2023 Mar 1
+    dueDate = Date.date 2023 May 1
+    advanceRate = 0.90
+    discountFee = 1200.0
+
+  -- 1. Create invoice, bid, and advance contract.
+  invoiceCid <- submit supplier do
+    createCmd Invoice with
+      operator, supplier, buyer, invoiceId, amount, issueDate, dueDate
+
+  bidCid <- submit factor do
+    exerciseCmd invoiceCid Invoice_SubmitBid with
+      factor, advanceRate, discountFee
+
+  advanceCid <- submit supplier do
+    exerciseCmd bidCid FactoringBid_Accept
+
+  -- 2. Time passes beyond the due date. Buyer does not pay. Factor declares default.
+  -- This archives the Advance and creates a SupplierObligation.
+  obligationCid <- submit factor do
+    exerciseCmd advanceCid Advance_DeclareDefault
+
+  -- 3. Supplier fulfills their recourse obligation by repaying the factor.
+  -- This archives the SupplierObligation.
+  submit supplier do
+    exerciseCmd obligationCid SupplierObligation_Fulfill
+
+  -- 4. Verify final state.
+  advances <- query @Advance factor
+  assertMsg "Advance contract should be archived after default" $ null advances
+
+  obligations <- query @SupplierObligation supplier
+  assertMsg "SupplierObligation should be archived after fulfillment" $ null obligations
+
+  return ()
+
+
+-- | Test that unauthorized parties cannot exercise critical choices.
+test_unauthorized_actions = script do
+  (operator, supplier, buyer, factor) <- setupParties
+  let
+    invoiceId = "INV-2023-004"
+    amount = 1000.0
+    issueDate = Date.date 2023 Apr 1
+    dueDate = Date.date 2023 Jun 1
+
+  -- Setup: Create an invoice and a bid.
+  invoiceCid <- submit supplier do
+    createCmd Invoice with
+      operator, supplier, buyer, invoiceId, amount, issueDate, dueDate
+
+  bidCid <- submit factor do
+    exerciseCmd invoiceCid Invoice_SubmitBid with
+      factor, advanceRate = 0.80, discountFee = 40.0
+
+  -- Test 1: Buyer (non-controller) attempts to accept the bid.
+  submitMustFail buyer do
+    exerciseCmd bidCid FactoringBid_Accept
+
+  -- Test 2: Factor (non-controller) attempts to accept their own bid.
+  submitMustFail factor do
+    exerciseCmd bidCid FactoringBid_Accept
+
+  -- Test 3: Operator (non-controller) attempts to accept the bid.
+  submitMustFail operator do
+    exerciseCmd bidCid FactoringBid_Accept
+
+  -- Setup for Advance choices: Accept the bid properly.
+  advanceCid <- submit supplier do
+    exerciseCmd bidCid FactoringBid_Accept
+
+  -- Test 4: Supplier (non-controller) attempts to settle the invoice.
+  submitMustFail supplier do
+    exerciseCmd advanceCid Advance_SettleInvoice with settlementAmount = amount
+
+  -- Test 5: Factor (non-controller) attempts to settle the invoice.
+  submitMustFail factor do
+    exerciseCmd advanceCid Advance_SettleInvoice with settlementAmount = amount
+
+  -- Verify the Advance contract is still active.
+  maybeAdvance <- queryContractId buyer advanceCid
+  assertMsg "Advance contract should still be active after failed attempts" $ not $ isNone maybeAdvance
+
+  return ()
